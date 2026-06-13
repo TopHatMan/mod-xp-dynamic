@@ -97,7 +97,6 @@ public:
     {
         uint32 xp = GetSkillXPRoll();
 
-        // Overflow: lucky rolls can push past the skill cap by up to 5 points
         if (allowOverflow && xp > 1)
         {
             uint32 current = player->GetSkillValue(skillId);
@@ -114,7 +113,7 @@ public:
 
         switch (xp)
         {
-        case 1: break; // Silent
+        case 1: break;
         case 2:
             ChatHandler(player->GetSession()).PSendSysMessage(
                 "|cff00ff00Lucky! Bonus skill gain! +2 XP!|r");
@@ -132,7 +131,6 @@ public:
             ChatHandler(player->GetSession()).PSendSysMessage(
                 "|cffFFD700*** JACKPOT! Bonus skill gain! +5 XP! ***|r");
 
-            // Announce jackpot to group
             if (Group* group = player->GetGroup())
                 for (GroupReference* gref = group->GetFirstMember(); gref; gref = gref->next())
                     if (Player* member = gref->GetSource(); member && member != player)
@@ -155,8 +153,8 @@ public:
         return result ? result->Fetch()[0].Get<uint8>() : 0;
     }
 
-    // Rebuild highest level by scanning ALL characters on the account.
-    // Used on login to self-heal wiped or missing table entries.
+    // Full account scan — used on login to self-heal wiped/missing entries.
+    // Finds the true highest level across ALL characters on the account.
     static void RebuildAccountHighestLevel(uint32 accountId, uint8 currentPlayerLevel)
     {
         QueryResult result = CharacterDatabase.Query(
@@ -164,8 +162,6 @@ public:
             accountId);
 
         uint8 trueHighest = result ? result->Fetch()[0].Get<uint8>() : currentPlayerLevel;
-
-        // Ensure current player's level is included even if not saved to DB yet
         if (currentPlayerLevel > trueHighest)
             trueHighest = currentPlayerLevel;
 
@@ -191,49 +187,61 @@ public:
         return result ? result->Fetch()[0].Get<float>() : 1.0f;
     }
 
-    // Recalculate alt bonus based on number of server-capped characters.
-    // Pass currentPlayer when calling from OnPlayerLevelChanged at cap —
-    // their new level may not be written to the characters table yet,
-    // so we exclude them from the DB query and add 1 manually.
+    // ── Alt Bonus Recalculation ───────────────────────────────────────
+    // Multiplier is based on how many characters are AT the account's
+    // highest level. Those chars are the "leaders" — everyone below them
+    // gets the bonus.
+    //
+    // Example: highest level = 6, two chars at level 6
+    //   charsAtHighest = 2
+    //   multiplier = 1.0 + (2 * 0.25) = 1.50x
+    //   anyone at levels 1-5 gets 1.50x XP
+    //
+    // Pass currentPlayer when called from OnPlayerLevelChanged so we can
+    // handle the timing gap where the new level isn't in the DB yet.
+
     static void RecalculateAltBonus(uint32 accountId, Player* currentPlayer = nullptr)
     {
-        uint8 serverCap = static_cast<uint8>(sWorld->getIntConfig(CONFIG_MAX_PLAYER_LEVEL));
         float perChar = sConfigMgr->GetOption<float>("Dynamic.XP.AccountBonus.PerMaxedChar", 0.25f);
         float maxMult = sConfigMgr->GetOption<float>("Dynamic.XP.AccountBonus.MaxMultiplier", 5.0f);
 
-        uint32 cappedCount = 0;
+        uint8 highestLevel = GetAccountHighestLevel(accountId);
+        if (highestLevel == 0)
+            return;
 
-        if (currentPlayer)
+        uint32 charsAtHighest = 0;
+
+        if (currentPlayer && currentPlayer->GetLevel() == highestLevel)
         {
-            // Exclude current player from DB query — level not saved yet
+            // Player just reached a new highest level — not saved to DB yet.
+            // Count others AT this level and add 1 for current player.
             QueryResult result = CharacterDatabase.Query(
-                "SELECT COUNT(*) FROM characters WHERE account = {} AND level >= {} AND guid != {}",
-                accountId, serverCap, currentPlayer->GetGUID().GetCounter());
+                "SELECT COUNT(*) FROM characters WHERE account = {} AND level = {} AND guid != {}",
+                accountId, highestLevel, currentPlayer->GetGUID().GetCounter());
 
-            cappedCount = (result ? result->Fetch()[0].Get<uint32>() : 0) + 1;
+            charsAtHighest = (result ? result->Fetch()[0].Get<uint32>() : 0) + 1;
         }
         else
         {
             QueryResult result = CharacterDatabase.Query(
-                "SELECT COUNT(*) FROM characters WHERE account = {} AND level >= {}",
-                accountId, serverCap);
+                "SELECT COUNT(*) FROM characters WHERE account = {} AND level = {}",
+                accountId, highestLevel);
 
-            cappedCount = result ? result->Fetch()[0].Get<uint32>() : 0;
+            charsAtHighest = result ? result->Fetch()[0].Get<uint32>() : 0;
         }
 
-        float multiplier = std::min(1.0f + (cappedCount * perChar), maxMult);
+        float multiplier = std::min(1.0f + (charsAtHighest * perChar), maxMult);
 
         CharacterDatabase.Execute(
             "INSERT INTO account_xp_bonus (account_id, capped_chars, multiplier) "
             "VALUES ({}, {}, {}) "
             "ON DUPLICATE KEY UPDATE capped_chars = {}, multiplier = {}",
-            accountId, cappedCount, multiplier, cappedCount, multiplier);
+            accountId, charsAtHighest, multiplier, charsAtHighest, multiplier);
     }
 
-    // ── Alt Bonus Logic ───────────────────────────────────────────────
-    // Returns the XP multiplier for an alt character.
-    // Bonus applies only when the player is below their account's personal
-    // highest level. Magnitude is based on number of server-capped chars.
+    // ── Alt Bonus Gate ────────────────────────────────────────────────
+    // Returns XP multiplier if player is below account's highest level.
+    // At or above highest level = no bonus (you ARE the leader).
 
     float GetAltBonus(Player* player)
     {
@@ -244,11 +252,9 @@ public:
         uint32 accountId = player->GetSession()->GetAccountId();
         uint8  highestLevel = GetAccountHighestLevel(accountId);
 
-        // No bonus if no higher character exists on the account
         if (highestLevel <= 1)
             return 1.0f;
 
-        // No bonus at or above the account's personal highest level
         if (playerLevel >= highestLevel)
             return 1.0f;
 
@@ -265,12 +271,9 @@ public:
 
         uint32 accountId = player->GetSession()->GetAccountId();
 
-        // Self-heal on login: scan ALL characters on the account to rebuild
-        // the true highest level. Handles wiped tables, new installs, and
-        // the playerbot scenario where multiple chars level simultaneously.
+        // Full account scan on login — self-heals wiped tables and handles
+        // playerbots that leveled while the real player was offline.
         RebuildAccountHighestLevel(accountId, player->GetLevel());
-
-        // Recalculate alt bonus from actual capped char count in DB
         RecalculateAltBonus(accountId);
     }
 
@@ -278,33 +281,24 @@ public:
     {
         uint32 accountId = player->GetSession()->GetAccountId();
         uint8  newLevel = player->GetLevel();
-        uint8  serverCap = static_cast<uint8>(sWorld->getIntConfig(CONFIG_MAX_PLAYER_LEVEL));
 
-        // Update highest level for this account
-        // Handles both real players and playerbots leveling in the same group
+        // Update highest level — works for real players and playerbots alike
         UpdateAccountHighestLevel(accountId, newLevel);
 
-        // Recalculate alt bonus multiplier
-        // At server cap: exclude current player from DB query (timing fix)
-        // Below cap: normal DB query is fine
-        if (newLevel >= serverCap)
-            RecalculateAltBonus(accountId, player);
-        else
-            RecalculateAltBonus(accountId);
+        // Recalculate bonus — pass player so timing gap is handled correctly
+        RecalculateAltBonus(accountId, player);
 
         // ── Class Fixes ───────────────────────────────────────────────
-        // Grant spells that cross-faction ARAC characters cannot obtain
-        // through normal trainer/quest chains.
 
         uint8  playerClass = player->getClass();
         TeamId team = player->GetTeamId();
 
-        // Horde Paladin — Redemption at level 12 (Alliance trainer timing)
+        // Horde Paladin — Redemption at level 12
         if (sConfigMgr->GetOption<bool>("Dynamic.ClassFix.HordePaladin.Enable", true))
             if (playerClass == CLASS_PALADIN && team == TEAM_HORDE && newLevel == 12)
                 player->learnSpell(7328);
 
-        // Alliance Shaman — Totem unlock spells at Horde quest equivalent levels
+        // Alliance Shaman — Totem unlocks at Horde quest equivalent levels
         if (sConfigMgr->GetOption<bool>("Dynamic.ClassFix.AllianceShaman.Enable", true))
         {
             if (playerClass == CLASS_SHAMAN && team == TEAM_ALLIANCE)
@@ -314,7 +308,6 @@ public:
                 case 4:  player->learnSpell(8073); break; // Earth Totem
                 case 10: player->learnSpell(2075); break; // Fire Totem
                 case 20: player->learnSpell(5396); break; // Water Totem
-                    // Air Totem (8385): no spell needed, totem item is sufficient
                 default: break;
                 }
             }
@@ -390,7 +383,7 @@ public:
             return;
         if (IsPlayerBot(player) && !BotHasRealPlayerInGroup(player))
             return;
-        AwardSkillXP(player, skillId, true); // overflow allowed
+        AwardSkillXP(player, skillId, true);
     }
 
     // Crafting — alchemy, blacksmithing, cooking, etc.
@@ -403,7 +396,7 @@ public:
             return;
         if (IsPlayerBot(player) && !BotHasRealPlayerInGroup(player))
             return;
-        AwardSkillXP(player, skill->SkillLine, true); // overflow allowed
+        AwardSkillXP(player, skill->SkillLine, true);
     }
 
     // Weapons, defense, fishing, etc.
@@ -416,7 +409,7 @@ public:
             return;
         if (IsPlayerBot(player) && !BotHasRealPlayerInGroup(player))
             return;
-        AwardSkillXP(player, skillId, false); // no overflow for combat skills
+        AwardSkillXP(player, skillId, false);
     }
 };
 

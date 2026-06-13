@@ -114,7 +114,7 @@ public:
 
         switch (xp)
         {
-        case 1:  break; // Silent
+        case 1: break; // Silent
         case 2:
             ChatHandler(player->GetSession()).PSendSysMessage(
                 "|cff00ff00Lucky! Bonus skill gain! +2 XP!|r");
@@ -155,6 +155,26 @@ public:
         return result ? result->Fetch()[0].Get<uint8>() : 0;
     }
 
+    // Rebuild highest level by scanning ALL characters on the account.
+    // Used on login to self-heal wiped or missing table entries.
+    static void RebuildAccountHighestLevel(uint32 accountId, uint8 currentPlayerLevel)
+    {
+        QueryResult result = CharacterDatabase.Query(
+            "SELECT MAX(level) FROM characters WHERE account = {}",
+            accountId);
+
+        uint8 trueHighest = result ? result->Fetch()[0].Get<uint8>() : currentPlayerLevel;
+
+        // Ensure current player's level is included even if not saved to DB yet
+        if (currentPlayerLevel > trueHighest)
+            trueHighest = currentPlayerLevel;
+
+        CharacterDatabase.Execute(
+            "INSERT INTO account_highest_level (account_id, highest_level) VALUES ({}, {}) "
+            "ON DUPLICATE KEY UPDATE highest_level = {}",
+            accountId, trueHighest, trueHighest);
+    }
+
     static void UpdateAccountHighestLevel(uint32 accountId, uint8 newLevel)
     {
         CharacterDatabase.Execute(
@@ -172,8 +192,9 @@ public:
     }
 
     // Recalculate alt bonus based on number of server-capped characters.
-    // Pass the player pointer so we can exclude them from the DB query —
-    // their new level may not be written to the characters table yet.
+    // Pass currentPlayer when calling from OnPlayerLevelChanged at cap —
+    // their new level may not be written to the characters table yet,
+    // so we exclude them from the DB query and add 1 manually.
     static void RecalculateAltBonus(uint32 accountId, Player* currentPlayer = nullptr)
     {
         uint8 serverCap = static_cast<uint8>(sWorld->getIntConfig(CONFIG_MAX_PLAYER_LEVEL));
@@ -184,8 +205,7 @@ public:
 
         if (currentPlayer)
         {
-            // Exclude the current player from DB count; their level isn't saved yet.
-            // Add 1 manually if they just hit the server cap.
+            // Exclude current player from DB query — level not saved yet
             QueryResult result = CharacterDatabase.Query(
                 "SELECT COUNT(*) FROM characters WHERE account = {} AND level >= {} AND guid != {}",
                 accountId, serverCap, currentPlayer->GetGUID().GetCounter());
@@ -244,7 +264,13 @@ public:
                 "This server is running the |cff4CFF00Dynamic Rate|r module.");
 
         uint32 accountId = player->GetSession()->GetAccountId();
-        UpdateAccountHighestLevel(accountId, player->GetLevel());
+
+        // Self-heal on login: scan ALL characters on the account to rebuild
+        // the true highest level. Handles wiped tables, new installs, and
+        // the playerbot scenario where multiple chars level simultaneously.
+        RebuildAccountHighestLevel(accountId, player->GetLevel());
+
+        // Recalculate alt bonus from actual capped char count in DB
         RecalculateAltBonus(accountId);
     }
 
@@ -254,31 +280,31 @@ public:
         uint8  newLevel = player->GetLevel();
         uint8  serverCap = static_cast<uint8>(sWorld->getIntConfig(CONFIG_MAX_PLAYER_LEVEL));
 
+        // Update highest level for this account
+        // Handles both real players and playerbots leveling in the same group
         UpdateAccountHighestLevel(accountId, newLevel);
 
-        // Recalculate on every level so alts immediately see the updated bonus
+        // Recalculate alt bonus multiplier
+        // At server cap: exclude current player from DB query (timing fix)
+        // Below cap: normal DB query is fine
         if (newLevel >= serverCap)
-            RecalculateAltBonus(accountId, player); // timing-safe: excludes current player from DB query
+            RecalculateAltBonus(accountId, player);
         else
             RecalculateAltBonus(accountId);
 
         // ── Class Fixes ───────────────────────────────────────────────
-        // These grant spells that cross-faction characters cannot obtain
-        // through normal trainers due to ARAC (Any Race Any Class) combos.
+        // Grant spells that cross-faction ARAC characters cannot obtain
+        // through normal trainer/quest chains.
 
         uint8  playerClass = player->getClass();
         TeamId team = player->GetTeamId();
 
-        // Horde Paladin — Redemption (Alliance-only trainer spell)
-        // Granted at level 12 to match Alliance Paladin trainer timing
+        // Horde Paladin — Redemption at level 12 (Alliance trainer timing)
         if (sConfigMgr->GetOption<bool>("Dynamic.ClassFix.HordePaladin.Enable", true))
-        {
             if (playerClass == CLASS_PALADIN && team == TEAM_HORDE && newLevel == 12)
-                player->learnSpell(7328); // Redemption
-        }
+                player->learnSpell(7328);
 
-        // Alliance Shaman — Totem unlock spells (Horde-only quest chains)
-        // Granted at the same levels the Horde totem quests become available
+        // Alliance Shaman — Totem unlock spells at Horde quest equivalent levels
         if (sConfigMgr->GetOption<bool>("Dynamic.ClassFix.AllianceShaman.Enable", true))
         {
             if (playerClass == CLASS_SHAMAN && team == TEAM_ALLIANCE)
@@ -288,7 +314,7 @@ public:
                 case 4:  player->learnSpell(8073); break; // Earth Totem
                 case 10: player->learnSpell(2075); break; // Fire Totem
                 case 20: player->learnSpell(5396); break; // Water Totem
-                    // Air Totem (8385) requires no spell — totem item is sufficient
+                    // Air Totem (8385): no spell needed, totem item is sufficient
                 default: break;
                 }
             }

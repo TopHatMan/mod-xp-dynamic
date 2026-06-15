@@ -5,7 +5,8 @@
  * Script reworked by Micrah/Milestorme and Poszer
  * Module Created by Micrah/Milestorme
  * Original Script from AshmaneCore https://github.com/conan513 Single Player Project
- * Extended with Gold, Reputation, Alt Progression Bonus, Skill XP, Class Fixes
+ * Extended with Gold, Reputation, Alt Progression Bonus, Skill XP, Class Fixes,
+ * Account Linking, Faction-Gated Alt Bonus
  */
 
 #include "Chat.h"
@@ -16,6 +17,7 @@
 #include "Map.h"
 #include "Group.h"
 #include "DBCStores.h"
+#include "StringFormat.h"
 #include <cmath>
 
 class spp_dynamic_xp_rate : public PlayerScript
@@ -80,8 +82,38 @@ public:
         return false;
     }
 
+    // ── Faction Helpers ───────────────────────────────────────────────
+    // faction: 0 = Alliance, 1 = Horde
+    // Alliance races: 1 Human, 3 Dwarf, 4 NightElf, 7 Gnome, 11 Draenei
+    // Horde races:    2 Orc,   5 Undead, 6 Tauren,  8 Troll, 10 BloodElf
+
+    static uint8 GetFactionId(TeamId team)
+    {
+        return (team == TEAM_ALLIANCE) ? 0 : 1;
+    }
+
+    static bool IsAllianceRace(uint8 race)
+    {
+        return race == 1 || race == 3 || race == 4 || race == 7 || race == 11;
+    }
+
+    // ── Account Linking ───────────────────────────────────────────────
+
+    static uint32 GetAccountGroupId(uint32 accountId)
+    {
+        QueryResult result = CharacterDatabase.Query(
+            "SELECT group_id FROM account_link_groups WHERE account_id = {}",
+            accountId);
+        return result ? result->Fetch()[0].Get<uint32>() : 0;
+    }
+
+    // Returns true if this account is linked to others
+    static bool IsAccountLinked(uint32 accountId)
+    {
+        return GetAccountGroupId(accountId) > 0;
+    }
+
     // ── Skill XP Roll ─────────────────────────────────────────────────
-    // 1 pt = 35%, 2 pts = 25%, 3 pts = 20%, 4 pts = 13%, 5 pts = 7%
 
     static uint32 GetSkillXPRoll()
     {
@@ -143,105 +175,132 @@ public:
         }
     }
 
-    // ── Account Tracking ─────────────────────────────────────────────
+    // ── Account Tracking (Faction-Aware) ─────────────────────────────
 
-    static uint8 GetAccountHighestLevel(uint32 accountId)
+    static uint8 GetAccountHighestLevel(uint32 accountId, uint8 faction)
     {
         QueryResult result = CharacterDatabase.Query(
-            "SELECT highest_level FROM account_highest_level WHERE account_id = {}",
-            accountId);
+            "SELECT highest_level FROM account_highest_level "
+            "WHERE account_id = {} AND faction = {}",
+            accountId, faction);
         return result ? result->Fetch()[0].Get<uint8>() : 0;
     }
 
-    // Full account scan — used on login to self-heal wiped/missing entries.
-    // Finds the true highest level across ALL characters on the account.
-    static void RebuildAccountHighestLevel(uint32 accountId, uint8 currentPlayerLevel)
+    static void RebuildAccountHighestLevel(uint32 accountId, uint8 faction, uint8 currentPlayerLevel)
     {
-        QueryResult result = CharacterDatabase.Query(
-            "SELECT MAX(level) FROM characters WHERE account = {}",
-            accountId);
+        // Scan all chars on account for this faction
+        QueryResult result;
+        if (faction == 0) // Alliance
+            result = CharacterDatabase.Query(
+                "SELECT MAX(level) FROM characters WHERE account = {} AND race IN (1,3,4,7,11)",
+                accountId);
+        else // Horde
+            result = CharacterDatabase.Query(
+                "SELECT MAX(level) FROM characters WHERE account = {} AND race IN (2,5,6,8,10)",
+                accountId);
 
         uint8 trueHighest = result ? result->Fetch()[0].Get<uint8>() : currentPlayerLevel;
         if (currentPlayerLevel > trueHighest)
             trueHighest = currentPlayerLevel;
 
         CharacterDatabase.Execute(
-            "INSERT INTO account_highest_level (account_id, highest_level) VALUES ({}, {}) "
+            "INSERT INTO account_highest_level (account_id, faction, highest_level) VALUES ({}, {}, {}) "
             "ON DUPLICATE KEY UPDATE highest_level = {}",
-            accountId, trueHighest, trueHighest);
+            accountId, faction, trueHighest, trueHighest);
     }
 
-    static void UpdateAccountHighestLevel(uint32 accountId, uint8 newLevel)
+    static void UpdateAccountHighestLevel(uint32 accountId, uint8 faction, uint8 newLevel)
     {
         CharacterDatabase.Execute(
-            "INSERT INTO account_highest_level (account_id, highest_level) VALUES ({}, {}) "
+            "INSERT INTO account_highest_level (account_id, faction, highest_level) VALUES ({}, {}, {}) "
             "ON DUPLICATE KEY UPDATE highest_level = GREATEST(highest_level, {})",
-            accountId, newLevel, newLevel);
+            accountId, faction, newLevel, newLevel);
     }
 
-    static float GetCachedAltMultiplier(uint32 accountId)
+    static float GetCachedAltMultiplier(uint32 accountId, uint8 faction)
     {
         QueryResult result = CharacterDatabase.Query(
-            "SELECT multiplier FROM account_xp_bonus WHERE account_id = {}",
-            accountId);
+            "SELECT multiplier FROM account_xp_bonus WHERE account_id = {} AND faction = {}",
+            accountId, faction);
         return result ? result->Fetch()[0].Get<float>() : 1.0f;
     }
 
-    // ── Alt Bonus Recalculation ───────────────────────────────────────
-    // Multiplier is based on how many characters are AT the account's
-    // highest level. Those chars are the "leaders" — everyone below them
-    // gets the bonus.
-    //
-    // Example: highest level = 6, two chars at level 6
-    //   charsAtHighest = 2
-    //   multiplier = 1.0 + (2 * 0.25) = 1.50x
-    //   anyone at levels 1-5 gets 1.50x XP
-    //
-    // Pass currentPlayer when called from OnPlayerLevelChanged so we can
-    // handle the timing gap where the new level isn't in the DB yet.
+    // ── Alt Bonus Recalculation (Faction + Account Link Aware) ────────
+    // Counts chars AT the highest level for this faction.
+    // If accounts are linked, counts across ALL linked accounts.
+    // Faction gate ensures Alliance bonus only comes from Alliance chars
+    // and Horde bonus only from Horde chars.
 
-    static void RecalculateAltBonus(uint32 accountId, Player* currentPlayer = nullptr)
+    static void RecalculateAltBonus(uint32 accountId, uint8 faction, Player* currentPlayer = nullptr)
     {
         float perChar = sConfigMgr->GetOption<float>("Dynamic.XP.AccountBonus.PerMaxedChar", 0.25f);
         float maxMult = sConfigMgr->GetOption<float>("Dynamic.XP.AccountBonus.MaxMultiplier", 5.0f);
 
-        uint8 highestLevel = GetAccountHighestLevel(accountId);
-        if (highestLevel == 0)
+        uint8 highestLevel = GetAccountHighestLevel(accountId, faction);
+        if (highestLevel <= 1)
             return;
 
+        uint32 groupId = GetAccountGroupId(accountId);
         uint32 charsAtHighest = 0;
+
+        // Build race filter string based on faction
+        const char* raceFilter = (faction == 0) ? "1,3,4,7,11" : "2,5,6,8,10";
 
         if (currentPlayer && currentPlayer->GetLevel() == highestLevel)
         {
-            // Player just reached a new highest level — not saved to DB yet.
-            // Count others AT this level and add 1 for current player.
-            QueryResult result = CharacterDatabase.Query(
-                "SELECT COUNT(*) FROM characters WHERE account = {} AND level = {} AND guid != {}",
-                accountId, highestLevel, currentPlayer->GetGUID().GetCounter());
-
-            charsAtHighest = (result ? result->Fetch()[0].Get<uint32>() : 0) + 1;
+            // Timing gap fix — player not saved to DB yet, count others + 1
+            if (groupId > 0)
+            {
+                QueryResult result = CharacterDatabase.Query(
+                    "SELECT COUNT(*) FROM characters WHERE account IN "
+                    "(SELECT account_id FROM account_link_groups WHERE group_id = {}) "
+                    "AND level = {} AND guid != {} AND race IN ({})",
+                    groupId, highestLevel, currentPlayer->GetGUID().GetCounter(), raceFilter);
+                charsAtHighest = (result ? result->Fetch()[0].Get<uint32>() : 0) + 1;
+            }
+            else
+            {
+                QueryResult result = CharacterDatabase.Query(
+                    "SELECT COUNT(*) FROM characters WHERE account = {} "
+                    "AND level = {} AND guid != {} AND race IN ({})",
+                    accountId, highestLevel, currentPlayer->GetGUID().GetCounter(), raceFilter);
+                charsAtHighest = (result ? result->Fetch()[0].Get<uint32>() : 0) + 1;
+            }
         }
         else
         {
-            QueryResult result = CharacterDatabase.Query(
-                "SELECT COUNT(*) FROM characters WHERE account = {} AND level = {}",
-                accountId, highestLevel);
-
-            charsAtHighest = result ? result->Fetch()[0].Get<uint32>() : 0;
+            if (groupId > 0)
+            {
+                QueryResult result = CharacterDatabase.Query(
+                    "SELECT COUNT(*) FROM characters WHERE account IN "
+                    "(SELECT account_id FROM account_link_groups WHERE group_id = {}) "
+                    "AND level = {} AND race IN ({})",
+                    groupId, highestLevel, raceFilter);
+                charsAtHighest = result ? result->Fetch()[0].Get<uint32>() : 0;
+            }
+            else
+            {
+                QueryResult result = CharacterDatabase.Query(
+                    "SELECT COUNT(*) FROM characters WHERE account = {} "
+                    "AND level = {} AND race IN ({})",
+                    accountId, highestLevel, raceFilter);
+                charsAtHighest = result ? result->Fetch()[0].Get<uint32>() : 0;
+            }
         }
 
         float multiplier = std::min(1.0f + (charsAtHighest * perChar), maxMult);
 
         CharacterDatabase.Execute(
-            "INSERT INTO account_xp_bonus (account_id, capped_chars, multiplier) "
-            "VALUES ({}, {}, {}) "
+            "INSERT INTO account_xp_bonus (account_id, faction, capped_chars, multiplier) "
+            "VALUES ({}, {}, {}, {}) "
             "ON DUPLICATE KEY UPDATE capped_chars = {}, multiplier = {}",
-            accountId, charsAtHighest, multiplier, charsAtHighest, multiplier);
+            accountId, faction, charsAtHighest, multiplier, charsAtHighest, multiplier);
     }
 
     // ── Alt Bonus Gate ────────────────────────────────────────────────
-    // Returns XP multiplier if player is below account's highest level.
-    // At or above highest level = no bonus (you ARE the leader).
+    // Faction-aware: Alliance chars only get bonus from Alliance leaders,
+    // Horde chars only from Horde leaders.
+    // Bonus only applies when player is below their faction's highest level.
 
     float GetAltBonus(Player* player)
     {
@@ -250,7 +309,8 @@ public:
 
         uint8  playerLevel = player->GetLevel();
         uint32 accountId = player->GetSession()->GetAccountId();
-        uint8  highestLevel = GetAccountHighestLevel(accountId);
+        uint8  faction = GetFactionId(player->GetTeamId());
+        uint8  highestLevel = GetAccountHighestLevel(accountId, faction);
 
         if (highestLevel <= 1)
             return 1.0f;
@@ -258,7 +318,7 @@ public:
         if (playerLevel >= highestLevel)
             return 1.0f;
 
-        return GetCachedAltMultiplier(accountId);
+        return GetCachedAltMultiplier(accountId, faction);
     }
 
     // ── Hooks ─────────────────────────────────────────────────────────
@@ -270,44 +330,39 @@ public:
                 "This server is running the |cff4CFF00Dynamic Rate|r module.");
 
         uint32 accountId = player->GetSession()->GetAccountId();
+        uint8  faction = GetFactionId(player->GetTeamId());
 
-        // Full account scan on login — self-heals wiped tables and handles
-        // playerbots that leveled while the real player was offline.
-        RebuildAccountHighestLevel(accountId, player->GetLevel());
-        RecalculateAltBonus(accountId);
+        RebuildAccountHighestLevel(accountId, faction, player->GetLevel());
+        RecalculateAltBonus(accountId, faction);
     }
 
     void OnPlayerLevelChanged(Player* player, uint8 /*oldLevel*/) override
     {
         uint32 accountId = player->GetSession()->GetAccountId();
         uint8  newLevel = player->GetLevel();
+        uint8  faction = GetFactionId(player->GetTeamId());
 
-        // Update highest level — works for real players and playerbots alike
-        UpdateAccountHighestLevel(accountId, newLevel);
-
-        // Recalculate bonus — pass player so timing gap is handled correctly
-        RecalculateAltBonus(accountId, player);
+        UpdateAccountHighestLevel(accountId, faction, newLevel);
+        RecalculateAltBonus(accountId, faction, player);
 
         // ── Class Fixes ───────────────────────────────────────────────
 
         uint8  playerClass = player->getClass();
         TeamId team = player->GetTeamId();
 
-        // Horde Paladin — Redemption at level 12
         if (sConfigMgr->GetOption<bool>("Dynamic.ClassFix.HordePaladin.Enable", true))
             if (playerClass == CLASS_PALADIN && team == TEAM_HORDE && newLevel == 12)
                 player->learnSpell(7328);
 
-        // Alliance Shaman — Totem unlocks at Horde quest equivalent levels
         if (sConfigMgr->GetOption<bool>("Dynamic.ClassFix.AllianceShaman.Enable", true))
         {
             if (playerClass == CLASS_SHAMAN && team == TEAM_ALLIANCE)
             {
                 switch (newLevel)
                 {
-                case 4:  player->learnSpell(8073); break; // Earth Totem
-                case 10: player->learnSpell(2075); break; // Fire Totem
-                case 20: player->learnSpell(5396); break; // Water Totem
+                case 4:  player->learnSpell(8073); break;
+                case 10: player->learnSpell(2075); break;
+                case 20: player->learnSpell(5396); break;
                 default: break;
                 }
             }
@@ -318,6 +373,8 @@ public:
     {
         if (!player || !sConfigMgr->GetOption<bool>("Dynamic.XP.Rate", true))
             return;
+
+        uint32 originalAmount = amount;
 
         uint8 level = player->GetLevel();
         bool inInstance = IsInInstance(player);
@@ -342,7 +399,17 @@ public:
         if (IsPlayerBot(player) && !BotHasRealPlayerInGroup(player))
             botRate = sConfigMgr->GetOption<float>("Dynamic.XP.BotSoloRate", 0.5f);
 
-        amount = static_cast<uint32>(std::round(amount * bracket * source * altBonus * botRate));
+        float totalMult = bracket * source * altBonus * botRate;
+        amount = static_cast<uint32>(std::round(originalAmount * totalMult));
+
+        // Show XP breakdown to real players when rate changes the value
+        if (!IsPlayerBot(player) && amount != originalAmount)
+        {
+            std::string msg = Acore::StringFormat(
+                "|cff00CCFFAshbringer XP:|r {} |cff888888→|r |cff00FF00{}|r |cff888888(|r|cffFFD700{:.2f}x|r|cff888888)|r",
+                originalAmount, amount, totalMult);
+            ChatHandler(player->GetSession()).SendSysMessage(msg.c_str());
+        }
     }
 
     bool OnPlayerReputationChange(Player* player, uint32 /*factionID*/, int32& standing, bool /*incremental*/) override
@@ -350,11 +417,27 @@ public:
         if (!sConfigMgr->GetOption<bool>("Dynamic.Rep.Rate", true))
             return true;
 
+        if (standing <= 0)
+            return true; // don't message on rep loss
+
+        int32 originalStanding = standing;
+
         float rate = GetBracketRate(player->GetLevel(), "Dynamic.Rep.Rate");
         float altBonus = sConfigMgr->GetOption<bool>("Dynamic.Rep.AccountBonus.Enable", false)
             ? GetAltBonus(player) : 1.0f;
 
-        standing = static_cast<int32>(std::round(standing * rate * altBonus));
+        float totalMult = rate * altBonus;
+        standing = static_cast<int32>(std::round(standing * totalMult));
+
+        // Show rep breakdown to real players when rate changes the value
+        if (!IsPlayerBot(player) && standing != originalStanding)
+        {
+            std::string msg = Acore::StringFormat(
+                "|cffFF8C00Ashbringer REP:|r {} |cff888888→|r |cffFFCC00{}|r |cff888888(|r|cffFFD700{:.2f}x|r|cff888888)|r",
+                originalStanding, standing, totalMult);
+            ChatHandler(player->GetSession()).SendSysMessage(msg.c_str());
+        }
+
         return true;
     }
 
@@ -370,7 +453,17 @@ public:
         if (rate == 1.0f)
             return;
 
+        uint32 originalGold = killed->loot.gold;
         killed->loot.gold = static_cast<uint32>(std::round(killed->loot.gold * rate));
+
+        // Show gold boost to real players
+        if (!IsPlayerBot(killer) && killed->loot.gold != originalGold)
+        {
+            std::string msg = Acore::StringFormat(
+                "|cffFFD700Ashbringer GOLD:|r {}c |cff888888→|r |cffFFFF00{}c|r |cff888888(|r|cffFFD700{:.2f}x|r|cff888888)|r",
+                originalGold, killed->loot.gold, rate);
+            ChatHandler(killer->GetSession()).SendSysMessage(msg.c_str());
+        }
     }
 
     // Gathering — herbalism, mining, skinning
